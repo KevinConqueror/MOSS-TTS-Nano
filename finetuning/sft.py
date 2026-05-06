@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import shutil
@@ -79,6 +80,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--attn-implementation", type=str, default="auto")
+    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA finetuning through PEFT.")
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-target-modules", type=str, default="auto")
+    parser.add_argument("--lora-bias", type=str, default="none", choices=["none", "all", "lora_only"])
+    parser.add_argument(
+        "--save-merged-lora-checkpoint",
+        action="store_true",
+        help="Also export a merged full-model checkpoint for inference compatibility.",
+    )
     parser.add_argument(
         "--channelwise-loss-weight",
         type=str,
@@ -119,6 +131,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`save_every_epochs` must be > 0.")
     if args.num_workers < 0:
         raise ValueError("`num_workers` must be >= 0.")
+    if args.use_lora:
+        if args.lora_r <= 0:
+            raise ValueError("`lora_r` must be > 0 when LoRA is enabled.")
+        if args.lora_alpha <= 0:
+            raise ValueError("`lora_alpha` must be > 0 when LoRA is enabled.")
+        if args.lora_dropout < 0:
+            raise ValueError("`lora_dropout` must be >= 0 when LoRA is enabled.")
 
 
 def configure_torch_backends() -> None:
@@ -207,6 +226,78 @@ def unwrap_training_model(model):
     while hasattr(unwrapped, "module"):
         unwrapped = unwrapped.module
     return unwrapped
+
+
+def is_peft_model(model) -> bool:
+    return hasattr(model, "peft_config") and hasattr(model, "save_pretrained")
+
+
+def resolve_lora_target_modules(model, spec: str) -> List[str]:
+    if spec != "auto":
+        targets = [item.strip() for item in str(spec).split(",") if item.strip()]
+        if not targets:
+            raise ValueError("`lora_target_modules` resolved to an empty list.")
+        return targets
+
+    candidate_suffixes = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "c_attn",
+        "c_proj",
+        "c_fc",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "w1",
+        "w2",
+        "w3",
+        "query",
+        "key",
+        "value",
+        "dense",
+    )
+    linear_suffixes: List[str] = []
+    for module_name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        suffix = module_name.split(".")[-1]
+        if any(token in module_name for token in ("audio_lm_heads", "text_lm_head", "audio_embeddings")):
+            continue
+        linear_suffixes.append(suffix)
+
+    unique_suffixes = sorted(set(linear_suffixes))
+    preferred = [suffix for suffix in candidate_suffixes if suffix in unique_suffixes]
+    targets = preferred or unique_suffixes
+    if not targets:
+        raise ValueError("Could not infer LoRA target modules from model linear layers.")
+    return targets
+
+
+def maybe_enable_lora(model, args: argparse.Namespace):
+    if not args.use_lora:
+        return model, None
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "LoRA finetuning requires `peft`. Install it in the training environment before using --use-lora."
+        ) from exc
+
+    target_modules = resolve_lora_target_modules(model, args.lora_target_modules)
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+        target_modules=target_modules,
+        inference_mode=False,
+    )
+    model = get_peft_model(model, lora_config)
+    return model, target_modules
 
 
 def compute_supervised_loss(
@@ -335,19 +426,45 @@ def save_checkpoint(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     unwrapped_model = unwrap_training_model(model)
-    unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = str(Path(codec_path).expanduser().resolve())
-    unwrapped_model.config.save_pretrained(output_dir)
-    state_dict = {
-        key: value.detach().cpu()
-        for key, value in unwrapped_model.state_dict().items()
-    }
-    torch.save(state_dict, output_dir / "pytorch_model.bin")
-    tokenizer.save_pretrained(output_dir)
+    resolved_codec_path = str(Path(codec_path).expanduser().resolve())
 
-    for filename in MODEL_SUPPORT_FILES:
-        src = resolve_asset(model_path, filename)
-        if src is not None and src.exists():
-            shutil.copy2(src, output_dir / filename)
+    if is_peft_model(unwrapped_model):
+        base_model = unwrapped_model.get_base_model()
+        if hasattr(base_model, "config"):
+            base_model.config.audio_tokenizer_pretrained_name_or_path = resolved_codec_path
+            base_model.config.save_pretrained(output_dir)
+        unwrapped_model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        if bool(train_args.get("save_merged_lora_checkpoint")):
+            merged_output_dir = output_dir.with_name(output_dir.name + "-merged")
+            merged_output_dir.mkdir(parents=True, exist_ok=True)
+            merge_source = copy.deepcopy(unwrapped_model).to("cpu")
+            merged_model = merge_source.merge_and_unload()
+            if hasattr(merged_model, "config"):
+                merged_model.config.audio_tokenizer_pretrained_name_or_path = resolved_codec_path
+                merged_model.config.save_pretrained(merged_output_dir)
+            state_dict = {key: value.detach().cpu() for key, value in merged_model.state_dict().items()}
+            torch.save(state_dict, merged_output_dir / "pytorch_model.bin")
+            tokenizer.save_pretrained(merged_output_dir)
+            for filename in MODEL_SUPPORT_FILES:
+                src = resolve_asset(model_path, filename)
+                if src is not None and src.exists():
+                    shutil.copy2(src, merged_output_dir / filename)
+    else:
+        unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = resolved_codec_path
+        unwrapped_model.config.save_pretrained(output_dir)
+        state_dict = {
+            key: value.detach().cpu()
+            for key, value in unwrapped_model.state_dict().items()
+        }
+        torch.save(state_dict, output_dir / "pytorch_model.bin")
+        tokenizer.save_pretrained(output_dir)
+
+        for filename in MODEL_SUPPORT_FILES:
+            src = resolve_asset(model_path, filename)
+            if src is not None and src.exists():
+                shutil.copy2(src, output_dir / filename)
 
     metadata = dict(train_args)
     metadata["saved_global_step"] = int(global_step)
@@ -391,6 +508,9 @@ def main() -> None:
     )
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation(attn_implementation)
+    model, lora_target_modules = maybe_enable_lora(model, args)
+    if args.use_lora and accelerator.is_main_process and hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
 
     dataset = MossTTSNanoSFTDataset(
         records,
@@ -443,6 +563,7 @@ def main() -> None:
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
     train_args_to_save["attn_implementation"] = attn_implementation
+    train_args_to_save["resolved_lora_target_modules"] = lora_target_modules
 
     accelerator.print(
         f"[{format_timestamp()}] [sft] loaded_records={len(dataset)} "

@@ -18,6 +18,7 @@ from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_req
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
 DEFAULT_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH = DEFAULT_AUDIO_TOKENIZER_PATH
 DEFAULT_OUTPUT_AUDIO_PATH = DEFAULT_OUTPUT_DIR / "infer_output.wav"
+DEFAULT_DECODING_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "decoding" / "default.yaml"
 
 
 def set_logging() -> None:
@@ -123,9 +124,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         nargs="?",
         const=1,
-        default=1,
+        default=None,
         choices=[0, 1],
-        help="Sample instead of greedy decoding. Accepts bare --do-sample or --do-sample 0/1.",
+        help="Override global sampling switch from the decoding YAML config. Accepts bare --do-sample or --do-sample 0/1.",
+    )
+    parser.add_argument(
+        "--text-do-sample",
+        type=int,
+        nargs="?",
+        const=1,
+        default=None,
+        choices=[0, 1],
+        help="Override text-side sampling switch from the decoding YAML config.",
+    )
+    parser.add_argument(
+        "--audio-do-sample",
+        type=int,
+        nargs="?",
+        const=1,
+        default=None,
+        choices=[0, 1],
+        help="Override audio-side sampling switch from the decoding YAML config.",
     )
     parser.add_argument("--text-temperature", type=float, default=None, help="Text-layer sampling temperature. Default: 1.5.")
     parser.add_argument("--text-top-p", type=float, default=None, help="Text-layer top-p sampling. Default: 1.0.")
@@ -172,6 +191,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--top-p", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--repetition-penalty", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--decoding-config",
+        default=str(DEFAULT_DECODING_CONFIG_PATH),
+        help="YAML file describing decoding strategy defaults.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for sampling.")
 
     parser.add_argument("--debug_ip", type=str, default="localhost")
@@ -225,16 +249,82 @@ def load_model(checkpoint: str, device: torch.device, dtype: torch.dtype):
     return model
 
 
+def load_decoding_config(path: str | Path) -> dict[str, object]:
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError("PyYAML is required to load decoding config files.") from exc
+
+    config_path = Path(path).expanduser().resolve()
+    with config_path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"decoding config must be a YAML mapping: {config_path}")
+    return payload
+
+
 def resolve_sampling_kwargs(args: argparse.Namespace) -> dict[str, object]:
-    text_temperature = 1.0 if args.text_temperature is None else float(args.text_temperature)
-    text_top_p = 1.0 if args.text_top_p is None else float(args.text_top_p)
-    text_top_k = 50 if args.text_top_k is None else int(args.text_top_k)
-    audio_temperature = 0.8 if args.audio_temperature is None else float(args.audio_temperature)
-    audio_top_p = 0.95 if args.audio_top_p is None else float(args.audio_top_p)
-    audio_top_k = 25 if args.audio_top_k is None else int(args.audio_top_k)
-    audio_repetition_penalty = (
-        1.2 if args.audio_repetition_penalty is None else float(args.audio_repetition_penalty)
+    config = load_decoding_config(args.decoding_config)
+    do_sample = bool(config.get("do_sample", True))
+    text_do_sample = config.get("text_do_sample")
+    audio_do_sample = config.get("audio_do_sample")
+    text_temperature = float(config.get("text_temperature", 1.0))
+    text_top_p = float(config.get("text_top_p", 1.0))
+    text_top_k = int(config.get("text_top_k", 50))
+    audio_temperature = float(config.get("audio_temperature", 0.8))
+    audio_top_p = float(config.get("audio_top_p", 0.95))
+    audio_top_k = int(config.get("audio_top_k", 25))
+    audio_repetition_penalty = float(config.get("audio_repetition_penalty", 1.2))
+    adaptive_antidegeneration_enabled = bool(config.get("adaptive_antidegeneration_enabled", False))
+    adaptive_window_frames = int(config.get("adaptive_window_frames", 12))
+    adaptive_repeat_frame_ratio_threshold = float(config.get("adaptive_repeat_frame_ratio_threshold", 0.5))
+    adaptive_consecutive_repeat_frames_threshold = int(
+        config.get("adaptive_consecutive_repeat_frames_threshold", 4)
     )
+    adaptive_audio_temperature = float(config.get("adaptive_audio_temperature", 0.7))
+    adaptive_audio_top_p = float(config.get("adaptive_audio_top_p", 0.85))
+    adaptive_audio_top_k = int(config.get("adaptive_audio_top_k", 10))
+    adaptive_audio_repetition_penalty = float(config.get("adaptive_audio_repetition_penalty", 1.5))
+    adaptive_force_stop_consecutive_repeat_frames = int(
+        config.get("adaptive_force_stop_consecutive_repeat_frames", 10)
+    )
+    repetition_aware_logit_shaping_enabled = bool(config.get("repetition_aware_logit_shaping_enabled", False))
+    repetition_aware_window_tokens = int(config.get("repetition_aware_window_tokens", 32))
+    repetition_aware_frequency_penalty = float(config.get("repetition_aware_frequency_penalty", 0.15))
+    repetition_aware_consecutive_penalty = float(config.get("repetition_aware_consecutive_penalty", 0.5))
+    entropy_aware_decoding_enabled = bool(config.get("entropy_aware_decoding_enabled", False))
+    entropy_aware_low_entropy = float(config.get("entropy_aware_low_entropy", 0.35))
+    entropy_aware_high_entropy = float(config.get("entropy_aware_high_entropy", 0.65))
+    entropy_aware_temperature = float(config.get("entropy_aware_temperature", 0.65))
+    entropy_aware_top_p = float(config.get("entropy_aware_top_p", 0.8))
+    entropy_aware_top_k = int(config.get("entropy_aware_top_k", 10))
+    entropy_aware_hysteresis_enabled = bool(config.get("entropy_aware_hysteresis_enabled", False))
+    entropy_aware_enter_high_steps = int(config.get("entropy_aware_enter_high_steps", 2))
+    entropy_aware_exit_low_steps = int(config.get("entropy_aware_exit_low_steps", 2))
+    entropy_triggered_short_horizon_branching_enabled = bool(
+        config.get("entropy_triggered_short_horizon_branching_enabled", False)
+    )
+    entropy_triggered_short_horizon_branching_threshold = float(
+        config.get("entropy_triggered_short_horizon_branching_threshold", 0.6)
+    )
+    entropy_triggered_short_horizon_branching_num_candidates = int(
+        config.get("entropy_triggered_short_horizon_branching_num_candidates", 4)
+    )
+    entropy_triggered_short_horizon_branching_repeat_frame_penalty = float(
+        config.get("entropy_triggered_short_horizon_branching_repeat_frame_penalty", 0.75)
+    )
+
+    if text_do_sample is not None:
+        text_do_sample = bool(text_do_sample)
+    if audio_do_sample is not None:
+        audio_do_sample = bool(audio_do_sample)
+
+    if args.do_sample is not None:
+        do_sample = bool(args.do_sample)
+    if args.text_do_sample is not None:
+        text_do_sample = bool(args.text_do_sample)
+    if args.audio_do_sample is not None:
+        audio_do_sample = bool(args.audio_do_sample)
 
     if args.temperature is not None:
         if args.text_temperature is None:
@@ -255,6 +345,9 @@ def resolve_sampling_kwargs(args: argparse.Namespace) -> dict[str, object]:
         audio_repetition_penalty = float(args.repetition_penalty)
 
     return {
+        "do_sample": do_sample,
+        "text_do_sample": text_do_sample,
+        "audio_do_sample": audio_do_sample,
         "text_temperature": text_temperature,
         "text_top_p": text_top_p,
         "text_top_k": text_top_k,
@@ -262,6 +355,32 @@ def resolve_sampling_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "audio_top_p": audio_top_p,
         "audio_top_k": audio_top_k,
         "audio_repetition_penalty": audio_repetition_penalty,
+        "adaptive_antidegeneration_enabled": adaptive_antidegeneration_enabled,
+        "adaptive_window_frames": adaptive_window_frames,
+        "adaptive_repeat_frame_ratio_threshold": adaptive_repeat_frame_ratio_threshold,
+        "adaptive_consecutive_repeat_frames_threshold": adaptive_consecutive_repeat_frames_threshold,
+        "adaptive_audio_temperature": adaptive_audio_temperature,
+        "adaptive_audio_top_p": adaptive_audio_top_p,
+        "adaptive_audio_top_k": adaptive_audio_top_k,
+        "adaptive_audio_repetition_penalty": adaptive_audio_repetition_penalty,
+        "adaptive_force_stop_consecutive_repeat_frames": adaptive_force_stop_consecutive_repeat_frames,
+        "repetition_aware_logit_shaping_enabled": repetition_aware_logit_shaping_enabled,
+        "repetition_aware_window_tokens": repetition_aware_window_tokens,
+        "repetition_aware_frequency_penalty": repetition_aware_frequency_penalty,
+        "repetition_aware_consecutive_penalty": repetition_aware_consecutive_penalty,
+        "entropy_aware_decoding_enabled": entropy_aware_decoding_enabled,
+        "entropy_aware_low_entropy": entropy_aware_low_entropy,
+        "entropy_aware_high_entropy": entropy_aware_high_entropy,
+        "entropy_aware_temperature": entropy_aware_temperature,
+        "entropy_aware_top_p": entropy_aware_top_p,
+        "entropy_aware_top_k": entropy_aware_top_k,
+        "entropy_aware_hysteresis_enabled": entropy_aware_hysteresis_enabled,
+        "entropy_aware_enter_high_steps": entropy_aware_enter_high_steps,
+        "entropy_aware_exit_low_steps": entropy_aware_exit_low_steps,
+        "entropy_triggered_short_horizon_branching_enabled": entropy_triggered_short_horizon_branching_enabled,
+        "entropy_triggered_short_horizon_branching_threshold": entropy_triggered_short_horizon_branching_threshold,
+        "entropy_triggered_short_horizon_branching_num_candidates": entropy_triggered_short_horizon_branching_num_candidates,
+        "entropy_triggered_short_horizon_branching_repeat_frame_penalty": entropy_triggered_short_horizon_branching_repeat_frame_penalty,
     }
 
 
@@ -341,25 +460,26 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     )
     maybe_print_voice_clone_text_chunks(model=model, args=args, text=text)
     logging.info("running inference mode=%s", args.mode)
-    result = model.inference(
-        text=text,
-        output_audio_path=args.output_audio_path,
-        mode=args.mode,
-        prompt_text=prompt_text,
-        prompt_audio_path=args.prompt_audio_path,
-        reference_audio_path=args.reference_audio_path,
-        text_tokenizer_path=args.text_tokenizer_path,
-        audio_tokenizer_type=MOSS_AUDIO_TOKENIZER_TYPE,
-        audio_tokenizer_pretrained_name_or_path=args.audio_tokenizer_pretrained_name_or_path,
-        device=device,
-        nq=args.nq,
-        max_new_frames=args.max_new_frames,
-        voice_clone_max_text_tokens=args.voice_clone_max_text_tokens,
-        voice_clone_max_memory_per_sample_gb=args.voice_clone_max_memory_per_sample_gb,
-        do_sample=bool(args.do_sample),
-        use_kv_cache=True,
+    inference_kwargs = {
+        "text": text,
+        "output_audio_path": args.output_audio_path,
+        "mode": args.mode,
+        "prompt_audio_path": args.prompt_audio_path,
+        "reference_audio_path": args.reference_audio_path,
+        "text_tokenizer_path": args.text_tokenizer_path,
+        "audio_tokenizer_type": MOSS_AUDIO_TOKENIZER_TYPE,
+        "audio_tokenizer_pretrained_name_or_path": args.audio_tokenizer_pretrained_name_or_path,
+        "device": device,
+        "nq": args.nq,
+        "max_new_frames": args.max_new_frames,
+        "voice_clone_max_text_tokens": args.voice_clone_max_text_tokens,
+        "voice_clone_max_memory_per_sample_gb": args.voice_clone_max_memory_per_sample_gb,
+        "use_kv_cache": True,
         **sampling_kwargs,
-    )
+    }
+    if args.mode != "voice_clone":
+        inference_kwargs["prompt_text"] = prompt_text
+    result = model.inference(**inference_kwargs)
     logging.info(
         "saved generated audio to %s sample_rate=%s frames=%s",
         result["audio_path"],

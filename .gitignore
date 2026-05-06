@@ -199,3 +199,12 @@ weights/tts/*.bin
 weights/tts/tokenizer.model
 generated_audio/*
 .app_prompt_uploads/*
+.sii
+
+datasets/
+output/
+
+models/*
+!models/MOSS-TTS-Nano/
+models/MOSS-TTS-Nano/*
+!models/MOSS-TTS-Nano/modeling_moss_tts_nano.py
